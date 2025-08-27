@@ -94,8 +94,8 @@ def optimize_img2img(init_image_path, csv_path, output_path,
     save_best_params(best_params_path, {"strength": best_strength, "guidance_scale": best_guidance})
     print(f"최적값 저장 완료: {best_params_path}")
 
-# --- 실행 예시 ---
 csv_file = "./dataset/character_keywords_weighted4.csv"
 init_image = "./input/damui.png"
 output_image = "./result/best_result.png"
 optimize_img2img(init_image, csv_file, output_image)
+
