@@ -1,70 +1,101 @@
-# main.py
+import csv
+import json
+from PIL import Image
+import numpy as np
+from skimage.metrics import structural_similarity as ssim
+from diffusers import StableDiffusionImg2ImgPipeline
+import torch
 import os
-import time
-from vlm_prompt import generate_prompt_from_image
-from sd_controlnet import (
-    load_pipelines, read_bgr, get_pose_control_image, log, set_seed
-)
 
-def generate_loop(pipe_t2i, pipe_i2i, openpose,
-                  image_paths, frames, strength, steps, guidance, seed,
-                  out_dir, use_feedback=False, feedback_denoise=0.25, batch=1,
-                  neg_prompt="blurry, lowres, deformed, bad anatomy, low quality"):
+# --- CSV에서 키워드 로드 ---
+def load_keywords_from_csv(csv_path):
+    keywords = []
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sentence = row['Keyword']
+            words = [w.strip() for w in sentence.replace(',', ' ').split() if w.strip()]
+            keywords.extend(words)
+    return keywords
 
-    os.makedirs(out_dir, exist_ok=True)
-    gen = set_seed(seed)
-    total = len(image_paths) if frames<=0 else min(frames, len(image_paths))
-    prev_img = None
-    times = []
+# --- 이미지 사이즈 맞춤 ---
+def resize_image(img, target_size=(512, 512)):
+    return img.resize(target_size, Image.LANCZOS)
 
-    for idx, path in enumerate(image_paths[:total]):
-        t0 = time.time()
-        frame_bgr = read_bgr(path)
-        control_pil = get_pose_control_image(openpose, frame_bgr)
+# --- SSIM 계산 ---
+def ssim_score(img1, img2):
+    img1 = np.array(img1.convert("L"))
+    img2 = np.array(img2.convert("L"))
+    return ssim(img1, img2)
 
-        # ✅ 여기서 VLM 불러오기
-        prompt = generate_prompt_from_image(control_pil)
-        print(f"[DEBUG] Frame {idx} Prompt: {prompt}")
+# --- 최적값 JSON 저장/불러오기 ---
+def save_best_params(json_path, params):
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(params, f, ensure_ascii=False, indent=2)
 
-        result = pipe_t2i(
-            prompt=[prompt]*batch,
-            negative_prompt=[neg_prompt]*batch if neg_prompt else None,
-            image=[control_pil]*batch,
-            controlnet_conditioning_scale=strength,
-            generator=gen,
-            num_inference_steps=steps,
-            guidance_scale=guidance,
-            height=512,
-            width=512
-        )
+def load_best_params(json_path):
+    if os.path.exists(json_path):
+        with open(json_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return None
 
-        for b, img in enumerate(result.images):
-            img.save(os.path.join(out_dir, f"frame_{idx:05d}_{b}.png"))
+# --- img2img 최적화 및 적용 ---
+def optimize_img2img(init_image_path, csv_path, output_path,
+                     best_params_path="./best_params.json",
+                     steps=10, strengths=[0.25,0.3,0.35], guidance_scales=[7.0,7.5,8.0]):
 
-        dt = time.time()-t0
-        times.append(dt)
-        log(f"[{idx+1}/{total}] {os.path.basename(path)} | {dt:.2f}s | FPS={1/dt:.2f}")
+    keywords = load_keywords_from_csv(csv_path)
+    prompt = ", ".join(keywords)
+    
+    original = Image.open(init_image_path).convert("RGB")
+    original = resize_image(original)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16
+    ).to(device)
 
-    if times:
-        avg = sum(times)/len(times)
-        log(f"Average FPS: {1/avg:.2f}")
+    # 기존 최적값 불러오기
+    best_params = load_best_params(best_params_path)
+    if best_params:
+        print("저장된 최적값 불러오기")
+        strength = best_params["strength"]
+        guidance = best_params["guidance_scale"]
+        result = pipe(prompt=prompt, image=original, strength=strength, guidance_scale=guidance).images[0]
+        result_resized = resize_image(result)
+        result_resized.save(output_path)
+        print(f"최적값 적용 완료: {output_path}, strength={strength}, guidance_scale={guidance}")
+        return
 
-def main():
-    input_path = "./input/damui.png"
+    # 없으면 탐색
+    best_score = -1
+    best_img = None
+    best_strength = None
+    best_guidance = None
 
-    pipe_t2i, pipe_i2i, openpose = load_pipelines()
+    for step in range(steps):
+        for strength in strengths:
+            for guidance in guidance_scales:
+                result = pipe(prompt=prompt, image=original, strength=strength, guidance_scale=guidance).images[0]
+                result_resized = resize_image(result)
+                score = ssim_score(original, result_resized)
+                print(f"Step {step+1}, strength={strength}, guidance={guidance}: SSIM={score:.4f}")
+                if score > best_score:
+                    best_score = score
+                    best_img = result_resized
+                    best_strength = strength
+                    best_guidance = guidance
 
-    generate_loop(
-        pipe_t2i, pipe_i2i, openpose,
-        image_paths=[input_path],
-        frames=1,
-        strength=0.85,
-        steps=18,
-        guidance=5.5,
-        seed=42,
-        out_dir="./out",
-        use_feedback=False
-    )
+    # 결과 저장
+    best_img.save(output_path)
+    print(f"최종 저장: {output_path}, 최고 SSIM={best_score:.4f}")
 
-if __name__=="__main__":
-    main()
+    # 최적값 저장
+    save_best_params(best_params_path, {"strength": best_strength, "guidance_scale": best_guidance})
+    print(f"최적값 저장 완료: {best_params_path}")
+
+# --- 실행 예시 ---
+csv_file = "./dataset/character_keywords_weighted4.csv"
+init_image = "./input/damui.png"
+output_image = "./result/best_result.png"
+optimize_img2img(init_image, csv_file, output_image)
