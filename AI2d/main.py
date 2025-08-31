@@ -11,9 +11,9 @@ import cv2
 # -----------------------------
 def load_keywords_from_csv(csv_path):
     df = pd.read_csv(csv_path)
-    if 'Keyword' not in df.columns:
+    if 'keyword' not in df.columns:
         raise KeyError("[ERROR] CSV 파일에 'keyword' 컬럼이 없습니다.")
-    return [str(row['Keyword']) for _, row in df.iterrows()]
+    return [str(row['keyword']) for _, row in df.iterrows()]
 
 # -----------------------------
 # ControlNet 포함 SD Img2Img Pipeline
@@ -96,10 +96,10 @@ def frames_to_video(frame_paths, output_path, fps=24):
 # -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--init", type=str, default="./input/damui.png", help="초기 이미지 경로")
-    parser.add_argument("--npy", type=str, default="./face_mesh/face_mesh_1min.npy", help="표정 npy 파일 경로")
+    parser.add_argument("--init", type=str, required=True, help="초기 이미지 경로")
+    parser.add_argument("--npy", type=str, default=None, help="표정 npy 파일 경로")
     parser.add_argument("--csv", type=str, default="./dataset/character_keywords_weighted4.csv", help="키워드 CSV 경로")
-    parser.add_argument("--out", type=str, default="./output", help="출력 디렉토리")
+    parser.add_argument("--out", type=str, default="./result", help="출력 디렉토리")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--strength", type=float, default=0.7)
     parser.add_argument("--guidance", type=float, default=7.5)
