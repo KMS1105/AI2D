@@ -1,101 +1,136 @@
-import csv
-import json
-from PIL import Image
-import numpy as np
-from skimage.metrics import structural_similarity as ssim
-from diffusers import StableDiffusionImg2ImgPipeline
-import torch
 import os
+import argparse
+import pandas as pd
+from PIL import Image
+import torch
+from diffusers import StableDiffusionImg2ImgPipeline, ControlNetModel
+import cv2
 
-# --- CSV에서 키워드 로드 ---
+# -----------------------------
+# CSV에서 키워드 로드
+# -----------------------------
 def load_keywords_from_csv(csv_path):
-    keywords = []
-    with open(csv_path, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            sentence = row['Keyword']
-            words = [w.strip() for w in sentence.replace(',', ' ').split() if w.strip()]
-            keywords.extend(words)
-    return keywords
+    df = pd.read_csv(csv_path)
+    if 'Keyword' not in df.columns:
+        raise KeyError("[ERROR] CSV 파일에 'keyword' 컬럼이 없습니다.")
+    return [str(row['Keyword']) for _, row in df.iterrows()]
 
-# --- 이미지 사이즈 맞춤 ---
-def resize_image(img, target_size=(512, 512)):
-    return img.resize(target_size, Image.LANCZOS)
+# -----------------------------
+# ControlNet 포함 SD Img2Img Pipeline
+# -----------------------------
+def create_sd_controlnet_pipeline(model_name="runwayml/stable-diffusion-v1-5", controlnet_name=None, device="cuda"):
+    if controlnet_name:
+        controlnet = ControlNetModel.from_pretrained(controlnet_name)
+        pipe = StableDiffusionImg2ImgPipeline.from_pretrained(model_name, controlnet=controlnet, torch_dtype=torch.float16)
+    else:
+        pipe = StableDiffusionImg2ImgPipeline.from_pretrained(model_name, torch_dtype=torch.float16)
+    pipe = pipe.to(device)
+    return pipe
 
-# --- SSIM 계산 ---
-def ssim_score(img1, img2):
-    img1 = np.array(img1.convert("L"))
-    img2 = np.array(img2.convert("L"))
-    return ssim(img1, img2)
+# -----------------------------
+# 시퀀스 렌더링
+# -----------------------------
+def render_sequence(pipe, init_image_path, npy_path=None, csv_path=None, out_dir="./result",
+                    negative_prompt="", start=0, end=None, step=1,
+                    seed=42, strength=0.7, guidance_scale=7.5,
+                    num_inference_steps=20, controlnet_weight=1.0, resize_size=(512,512)):
 
-# --- 최적값 JSON 저장/불러오기 ---
-def save_best_params(json_path, params):
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(params, f, ensure_ascii=False, indent=2)
+    os.makedirs(out_dir, exist_ok=True)
+    frames = []
 
-def load_best_params(json_path):
-    if os.path.exists(json_path):
-        with open(json_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return None
+    # 키워드 로드
+    prompts = load_keywords_from_csv(csv_path) if csv_path else [""]
 
-# --- img2img 최적화 및 적용 ---
-def optimize_img2img(init_image_path, csv_path, output_path,
-                     best_params_path="./best_params.json",
-                     steps=10, strengths=[0.25,0.3,0.35], guidance_scales=[7.0,7.5,8.0]):
+    # 초기 이미지
+    init_image = Image.open(init_image_path).convert("RGB")
+    if resize_size:
+        init_image = init_image.resize(resize_size)
 
-    keywords = load_keywords_from_csv(csv_path)
-    prompt = ", ".join(keywords)
-    
-    original = Image.open(init_image_path).convert("RGB")
-    original = resize_image(original)
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-        "runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16
-    ).to(device)
+    if end is None:
+        end = len(prompts)
 
-    # 기존 최적값 불러오기
-    best_params = load_best_params(best_params_path)
-    if best_params:
-        print("저장된 최적값 불러오기")
-        strength = best_params["strength"]
-        guidance = best_params["guidance_scale"]
-        result = pipe(prompt=prompt, image=original, strength=strength, guidance_scale=guidance).images[0]
-        result_resized = resize_image(result)
-        result_resized.save(output_path)
-        print(f"최적값 적용 완료: {output_path}, strength={strength}, guidance_scale={guidance}")
+    generator = torch.Generator(device=pipe.device).manual_seed(seed)
+
+    for idx in range(start, end, step):
+        prompt = prompts[idx % len(prompts)]  # 안전하게 반복
+        output = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=init_image,
+            strength=strength,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            generator=generator,
+            controlnet_conditioning_scale=controlnet_weight
+        ).images[0]
+
+        frame_path = os.path.join(out_dir, f"frame_{idx:04d}.png")
+        output.save(frame_path)
+        frames.append(frame_path)
+
+        print(f"[LOG] Saved frame {idx} -> {frame_path}")
+
+    return frames
+
+# -----------------------------
+# 프레임 -> mp4 변환
+# -----------------------------
+def frames_to_video(frame_paths, output_path, fps=24):
+    if not frame_paths:
+        print("[WARN] No frames to convert to video.")
         return
+    first_frame = cv2.imread(frame_paths[0])
+    height, width, layers = first_frame.shape
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # 없으면 탐색
-    best_score = -1
-    best_img = None
-    best_strength = None
-    best_guidance = None
+    for f in frame_paths:
+        img = cv2.imread(f)
+        video.write(img)
 
-    for step in range(steps):
-        for strength in strengths:
-            for guidance in guidance_scales:
-                result = pipe(prompt=prompt, image=original, strength=strength, guidance_scale=guidance).images[0]
-                result_resized = resize_image(result)
-                score = ssim_score(original, result_resized)
-                print(f"Step {step+1}, strength={strength}, guidance={guidance}: SSIM={score:.4f}")
-                if score > best_score:
-                    best_score = score
-                    best_img = result_resized
-                    best_strength = strength
-                    best_guidance = guidance
+    video.release()
+    print(f"[LOG] Video saved to {output_path}")
 
-    # 결과 저장
-    best_img.save(output_path)
-    print(f"최종 저장: {output_path}, 최고 SSIM={best_score:.4f}")
+# -----------------------------
+# 메인
+# -----------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--init", type=str, default="./input/damui.png", help="초기 이미지 경로")
+    parser.add_argument("--npy", type=str, default="./face_mesh/face_mesh_1min.npy", help="표정 npy 파일 경로")
+    parser.add_argument("--csv", type=str, default="./dataset/character_keywords_weighted4.csv", help="키워드 CSV 경로")
+    parser.add_argument("--out", type=str, default="./output", help="출력 디렉토리")
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--strength", type=float, default=0.7)
+    parser.add_argument("--guidance", type=float, default=7.5)
+    parser.add_argument("--controlnet_weight", type=float, default=1.0)
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--end", type=int, default=None)
+    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--model", type=str, default="runwayml/stable-diffusion-v1-5")
+    parser.add_argument("--controlnet", type=str, default=None)
+    args = parser.parse_args()
 
-    # 최적값 저장
-    save_best_params(best_params_path, {"strength": best_strength, "guidance_scale": best_guidance})
-    print(f"최적값 저장 완료: {best_params_path}")
+    pipe_i2i = create_sd_controlnet_pipeline(model_name=args.model, controlnet_name=args.controlnet)
 
-csv_file = "./dataset/character_keywords_weighted4.csv"
-init_image = "./input/damui.png"
-output_image = "./result/best_result.png"
-optimize_img2img(init_image, csv_file, output_image)
+    frames = render_sequence(
+        pipe_i2i,
+        init_image_path=args.init,
+        npy_path=args.npy,
+        csv_path=args.csv,
+        out_dir=args.out,
+        negative_prompt="low quality, deformed, extra limbs, extra faces",
+        start=args.start,
+        end=args.end,
+        step=1,
+        seed=args.seed,
+        strength=args.strength,
+        guidance_scale=args.guidance,
+        num_inference_steps=args.steps,
+        controlnet_weight=args.controlnet_weight,
+        resize_size=(512,512)
+    )
 
+    video_path = os.path.join(args.out, "result.mp4")
+    frames_to_video(frames, video_path, fps=args.fps)
